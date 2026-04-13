@@ -1,6 +1,4 @@
-Aquí tienes la guía completa de principio a fin:
 
----
 
 # Guía completa — API de WhatsApp a Power Automate
 
