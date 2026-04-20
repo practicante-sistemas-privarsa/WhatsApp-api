@@ -1,19 +1,42 @@
 const axios = require('axios');
 const { generateHash, toBase64, validateBuffer, isAllowedMimeType } = require('./utils');
 const { log } = require('./logger');
+const { getSession, createSession, updateSession } = require('./sessions');
 
-const { WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, POWER_AUTOMATE_URL, POWER_AUTOMATE_API_KEY } = process.env;
+const {
+  WHATSAPP_ACCESS_TOKEN,
+  WHATSAPP_PHONE_NUMBER_ID,
+  POWER_AUTOMATE_URL,
+  POWER_AUTOMATE_API_KEY,
+} = process.env;
 
-// Descarga el archivo desde WhatsApp usando el media_id
+// ─── Enviar mensaje de texto al usuario ───────────────────────────────────────
+async function sendWhatsAppMessage(phone, message) {
+  await axios.post(
+    `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to: phone,
+      type: 'text',
+      text: { body: message },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+}
+
+// ─── Descargar archivo desde WhatsApp ─────────────────────────────────────────
 async function downloadMedia(mediaId) {
-  // Paso 1: obtener URL del archivo
   const metaRes = await axios.get(
     `https://graph.facebook.com/v19.0/${mediaId}`,
     { headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` } }
   );
   const fileUrl = metaRes.data.url;
 
-  // Paso 2: descargar el archivo como buffer binario
   const fileRes = await axios.get(fileUrl, {
     responseType: 'arraybuffer',
     headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` },
@@ -22,7 +45,7 @@ async function downloadMedia(mediaId) {
   return Buffer.from(fileRes.data);
 }
 
-// Envía el payload a Power Automate con reintentos
+// ─── Enviar a Power Automate con reintentos ────────────────────────────────────
 async function sendToPowerAutomate(payload, retries = 3) {
   const delays = [1000, 5000, 10000];
   for (let i = 0; i < retries; i++) {
@@ -32,7 +55,7 @@ async function sendToPowerAutomate(payload, retries = 3) {
           'Content-Type': 'application/json',
           'x-api-key': POWER_AUTOMATE_API_KEY,
         },
-        timeout: 9000, // < 10 segundos
+        timeout: 9000,
       });
       return true;
     } catch (err) {
@@ -45,21 +68,18 @@ async function sendToPowerAutomate(payload, retries = 3) {
   }
 }
 
-// Procesa un mensaje individual con archivo adjunto
-async function processMediaMessage(msg, contact) {
-  const mediaType = msg.type; // 'image' o 'document'
+// ─── Procesar imagen recibida ──────────────────────────────────────────────────
+async function processMediaMessage(msg, phone, session) {
+  const mediaType = msg.type;
   const mediaData = msg[mediaType];
   const mimeType = mediaData.mime_type;
 
-  // Ignorar tipos no permitidos
   if (!isAllowedMimeType(mimeType)) {
-    console.log(`[SKIP] Tipo no permitido: ${mimeType}`);
+    await sendWhatsAppMessage(phone, 'Solo se aceptan imágenes (JPG, PNG) o archivos PDF.');
     return;
   }
 
   const message_id = msg.id;
-  const chat_id = contact.wa_id;
-  const user_phone = contact.wa_id;
   const timestamp = new Date(parseInt(msg.timestamp) * 1000).toISOString();
   const caption = msg.caption || '';
   const file_name = mediaData.filename || `archivo_${msg.id}`;
@@ -68,44 +88,43 @@ async function processMediaMessage(msg, contact) {
   let fileBuffer, hash, base64;
 
   try {
-    // Paso 3: Descargar archivo
     fileBuffer = await downloadMedia(media_id);
-
-    // Paso 4 y 5: Validar, generar hash y base64
-    validateBuffer(fileBuffer, mimeType);
     hash = generateHash(fileBuffer);
     base64 = toBase64(fileBuffer);
-
   } catch (err) {
-    log({ message_id, phone: user_phone, timestamp, error: err.message });
-    return; // No enviar nada si falla la descarga o validación
+    log({ message_id, phone, timestamp, error: err.message });
+    await sendWhatsAppMessage(phone, 'No se pudo descargar el archivo. Intenta enviarlo de nuevo.');
+    return;
   }
 
-  // Paso 6: Construir payload
+  // El folio de ruta viene de la sesión activa
   const payload = {
     message_id,
-    chat_id,
-    user_phone,
+    chat_id: phone,
+    user_phone: phone,
     timestamp,
     file_name,
     file_type: mimeType,
     caption,
     file_base64: base64,
     image_hash: hash,
+    folio_ruta: session.folio, // ← nuevo campo ligado a la sesión
   };
 
   try {
     await sendToPowerAutomate(payload);
-    log({ message_id, phone: user_phone, timestamp, result: 'POST enviado OK' });
+    updateSession(phone, { imageCount: session.imageCount + 1 });
+    log({ message_id, phone, timestamp, result: `POST enviado OK | folio: ${session.folio}` });
+    await sendWhatsAppMessage(phone, `✅ Imagen recibida y procesada (folio: ${session.folio}). Puedes enviar más imágenes o esperar a que la sesión finalice.`);
   } catch (err) {
-    log({ message_id, phone: user_phone, timestamp, error: `POST fallido: ${err.message}` });
+    log({ message_id, phone, timestamp, error: `POST fallido: ${err.message}` });
+    await sendWhatsAppMessage(phone, 'Ocurrió un error al procesar tu imagen. Intenta de nuevo.');
   }
 }
 
-// Handler principal del webhook
+// ─── Handler principal del webhook ────────────────────────────────────────────
 async function handleWebhook(req, res) {
-  // Responder 200 inmediatamente a WhatsApp (requerido)
-  res.sendStatus(200);
+  res.sendStatus(200); // Responder inmediatamente a Meta
 
   try {
     const body = req.body;
@@ -115,14 +134,49 @@ async function handleWebhook(req, res) {
       for (const change of entry.changes || []) {
         const value = change.value;
         const messages = value.messages || [];
-        const contacts = value.contacts || [];
 
         for (const msg of messages) {
-          // Solo procesar imagen o documento
-          if (!['image', 'document'].includes(msg.type)) continue;
+          const phone = msg.from;
+          let session = getSession(phone);
 
-          const contact = contacts.find(c => c.wa_id === msg.from) || { wa_id: msg.from };
-          processMediaMessage(msg, contact); // No await → respuesta < 10s
+          // ── Sin sesión activa → iniciar flujo ──
+          if (!session) {
+            createSession(phone);
+            await sendWhatsAppMessage(
+              phone,
+              '👋 Bienvenido al Servicio de Carga de Acuses.\n\nFavor de indicar a qué *folio de ruta* pertenece su acuse.'
+            );
+            continue;
+          }
+
+          // ── Sesión en estado WAITING_FOLIO → esperar el folio ──
+          if (session.state === 'WAITING_FOLIO') {
+            if (msg.type !== 'text') {
+              await sendWhatsAppMessage(phone, 'Por favor escribe el folio de ruta antes de enviar imágenes.');
+              continue;
+            }
+
+            const folio = msg.text.body.trim();
+            updateSession(phone, { state: 'RECEIVING_IMAGES', folio });
+
+            await sendWhatsAppMessage(
+              phone,
+              `✅ Folio *${folio}* registrado.\n\nAhora puede proceder a enviar las imágenes de los acuses.\n\n⏱️ Tienes *10 minutos* para enviar tus archivos.`
+            );
+            continue;
+          }
+
+          // ── Sesión en estado RECEIVING_IMAGES → procesar imágenes ──
+          if (session.state === 'RECEIVING_IMAGES') {
+            if (['image', 'document'].includes(msg.type)) {
+              await processMediaMessage(msg, phone, session);
+            } else {
+              await sendWhatsAppMessage(
+                phone,
+                `Estás en modo de carga de imágenes para el folio *${session.folio}*. Por favor envía tus archivos.`
+              );
+            }
+          }
         }
       }
     }
@@ -131,7 +185,7 @@ async function handleWebhook(req, res) {
   }
 }
 
-// Verificación del webhook (requerida por Meta)
+// ─── Verificación del webhook (requerida por Meta) ────────────────────────────
 function verifyWebhook(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
